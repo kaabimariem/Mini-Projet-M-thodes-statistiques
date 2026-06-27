@@ -1,0 +1,15 @@
+# Dataset brut (trop lourd pour GitHub, téléchargeable depuis UCI)
+Online Retail.xlsx
+Online Retail.csv
+*.xlsx
+*.csv
+
+# Fichiers R temporaires
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Outputs générés
+*.html
+*.pdf

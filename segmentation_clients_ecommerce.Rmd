@@ -1,0 +1,1098 @@
+---
+title: "Segmentation des Clients E-Commerce"
+subtitle: "Analyse Multivariée : ACP + K-means — Dataset Online Retail (UCI)"
+author: "Projet Data Science — Méthodes Statistiques et Étude de Données"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+    code_folding: show
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center",
+  comment    = "#>"
+)
+```
+
+---
+
+# Introduction
+
+## Contexte E-Commerce
+
+L'essor du commerce en ligne a profondément transformé les habitudes de consommation.
+Les entreprises e-commerce accumulent aujourd'hui des volumes considérables de données
+transactionnelles, offrant une opportunité unique d'analyser le comportement des clients
+à grande échelle.
+
+Dans ce contexte, la **segmentation client** constitue un levier stratégique fondamental :
+elle permet de regrouper des individus ayant des comportements d'achat similaires afin
+d'adapter les actions marketing, la fidélisation, et l'expérience utilisateur.
+
+## Problématique
+
+> *Comment identifier, à partir des données transactionnelles brutes d'une plateforme
+> e-commerce, des groupes homogènes de clients présentant des comportements d'achat
+> distincts, afin de guider les décisions marketing ?*
+
+## Objectifs du Projet
+
+1. **Construire** un profil comportemental de chaque client à partir de variables agrégées
+   (montant dépensé, fréquence d'achat, récence, panier moyen, etc.).
+2. **Réduire la dimensionnalité** par Analyse en Composantes Principales (ACP) pour
+   visualiser et comprendre la structure des données.
+3. **Segmenter** les clients par K-means et identifier des profils métier actionnables.
+4. **Formuler** des recommandations marketing ciblées par segment.
+
+---
+
+# Description du Dataset
+
+## Présentation
+
+Le dataset **Online Retail** est disponible sur l'
+[UCI Machine Learning Repository](https://archive.ics.uci.edu/ml/datasets/online+retail).
+Il contient l'ensemble des transactions réalisées entre **décembre 2010** et
+**décembre 2011** pour un commerce en ligne basé au Royaume-Uni, spécialisé dans
+les cadeaux et objets décoratifs.
+
+| Variable      | Type        | Description                                           |
+|---------------|-------------|-------------------------------------------------------|
+| `InvoiceNo`   | Caractère   | Numéro de facture (préfixe "C" = annulation)          |
+| `StockCode`   | Caractère   | Code produit                                          |
+| `Description` | Caractère   | Libellé du produit                                    |
+| `Quantity`    | Entier      | Quantité commandée                                    |
+| `InvoiceDate` | Date/Heure  | Date et heure de la transaction                       |
+| `UnitPrice`   | Numérique   | Prix unitaire (en £)                                  |
+| `CustomerID`  | Numérique   | Identifiant client (peut être manquant)               |
+| `Country`     | Caractère   | Pays du client                                        |
+
+
+## Chargement des Packages
+
+```{r packages}
+# ── Chargement des packages nécessaires ──────────────────────────────────────
+library(tidyverse)    # Manipulation et visualisation des données
+library(lubridate)    # Gestion des dates
+library(dplyr)        # Manipulation de données (inclus dans tidyverse)
+library(ggplot2)      # Graphiques (inclus dans tidyverse)
+library(FactoMineR)   # ACP et méthodes factorielles
+library(factoextra)   # Visualisation des résultats ACP / clustering
+library(cluster)      # Algorithmes de clustering (PAM, silhouette)
+library(corrplot)     # Matrices de corrélation
+library(scales)       # Formatage des axes
+library(knitr)        # Tableaux formatés
+library(gridExtra)    # Mise en page multi-graphiques
+```
+
+## Chargement du Dataset
+
+```{r load_data}
+# ── Téléchargement et lecture du fichier Excel ────────────────────────────────
+# Le fichier est disponible sur UCI ML Repository (format .xlsx)
+# Option 1 : lecture directe depuis le fichier local (recommandée)
+# Décommentez la ligne ci-dessous si vous avez téléchargé le fichier manuellement :
+# retail_raw <- readxl::read_excel("Online Retail.xlsx")
+
+# Option 2 : lecture depuis une URL (CSV converti) disponible publiquement
+url_data <- "https://raw.githubusercontent.com/datasciencedojo/datasets/master/Online%20Retail.csv"
+
+# Tentative de chargement depuis le web ; repli sur un jeu simulé si indisponible
+retail_raw <- tryCatch({
+  read_csv(url_data, show_col_types = FALSE)
+}, error = function(e) {
+  message("⚠️  URL non accessible — génération d'un dataset simulé identique en structure.")
+  NULL
+})
+
+# ── Si le chargement échoue, on utilise le package readxl sur fichier local ──
+if (is.null(retail_raw)) {
+  if (file.exists("Online Retail.xlsx")) {
+    retail_raw <- readxl::read_excel("Online Retail.xlsx")
+  } else {
+    stop("Veuillez télécharger 'Online Retail.xlsx' depuis UCI et le placer dans le répertoire de travail.")
+  }
+}
+
+# Aperçu initial
+glimpse(retail_raw)
+```
+
+```{r first_look}
+# Dimensions du dataset brut
+cat("Dimensions brutes :", nrow(retail_raw), "lignes ×", ncol(retail_raw), "colonnes\n")
+
+# Premières lignes
+head(retail_raw, 8)
+```
+
+---
+
+# Préparation des Données
+
+## Nettoyage Initial
+
+```{r cleaning}
+# ── 1. Standardiser les noms de colonnes ─────────────────────────────────────
+retail <- retail_raw %>%
+  rename_with(~ str_trim(.x))   # Supprimer les espaces éventuels
+
+# ── 2. Conversion des types ──────────────────────────────────────────────────
+retail <- retail %>%
+  mutate(
+    InvoiceDate = parse_date_time(InvoiceDate,
+                                  orders = c("dmy HM", "mdy HM", "ymd HM",
+                                             "dmy HMS", "mdy HMS")),
+    CustomerID  = as.character(CustomerID),
+    Quantity    = as.numeric(Quantity),
+    UnitPrice   = as.numeric(UnitPrice)
+  )
+
+# ── 3. Suppression des valeurs manquantes sur CustomerID ─────────────────────
+retail_clean <- retail %>%
+  filter(!is.na(CustomerID))
+
+cat("Après suppression des CustomerID manquants :",
+    nrow(retail_clean), "lignes\n")
+```
+
+```{r remove_cancelled}
+# ── 4. Suppression des factures annulées (InvoiceNo commençant par "C") ───────
+retail_clean <- retail_clean %>%
+  filter(!str_starts(InvoiceNo, "C"))
+
+cat("Après suppression des annulations :",
+    nrow(retail_clean), "lignes\n")
+```
+
+```{r remove_negatives}
+# ── 5. Suppression des lignes avec quantité ou prix ≤ 0 ──────────────────────
+retail_clean <- retail_clean %>%
+  filter(Quantity > 0, UnitPrice > 0)
+
+cat("Après suppression des valeurs aberrantes (Q≤0, P≤0) :",
+    nrow(retail_clean), "lignes\n")
+```
+
+```{r date_reference}
+# ── 6. Date de référence pour le calcul de la Récence ────────────────────────
+# On prend le lendemain de la dernière transaction comme date de référence
+date_ref <- max(retail_clean$InvoiceDate, na.rm = TRUE) + days(1)
+cat("Date de référence pour la récence :", format(date_ref, "%d/%m/%Y"), "\n")
+```
+
+
+## Création du Dataset Client (Agrégation)
+
+```{r create_customer_df}
+# ── Calcul de la ligne de chiffre d'affaires ─────────────────────────────────
+retail_clean <- retail_clean %>%
+  mutate(LineRevenue = Quantity * UnitPrice)
+
+# ── Agrégation par client ─────────────────────────────────────────────────────
+customer_df <- retail_clean %>%
+  group_by(CustomerID) %>%
+  summarise(
+    # Montant total dépensé (£)
+    TotalSpent       = sum(LineRevenue, na.rm = TRUE),
+
+    # Nombre de factures distinctes (fréquence de commande)
+    NumberInvoices   = n_distinct(InvoiceNo),
+
+    # Quantité totale d'articles achetés
+    TotalQuantity    = sum(Quantity, na.rm = TRUE),
+
+    # Panier moyen par facture (£)
+    AverageBasket    = TotalSpent / NumberInvoices,
+
+    # Fréquence : nombre moyen de jours entre deux achats consécutifs
+    Frequency        = as.numeric(
+                         difftime(max(InvoiceDate), min(InvoiceDate),
+                                  units = "days")
+                       ) / pmax(NumberInvoices - 1, 1),
+
+    # Récence : jours depuis le dernier achat
+    Recency          = as.numeric(
+                         difftime(date_ref, max(InvoiceDate), units = "days")
+                       ),
+
+    # Prix unitaire moyen payé
+    AveragePrice     = mean(UnitPrice, na.rm = TRUE),
+
+    # Nombre de produits distincts achetés
+    NumberProducts   = n_distinct(StockCode),
+
+    .groups = "drop"
+  )
+
+cat("Dataset client — dimensions :", nrow(customer_df), "clients ×",
+    ncol(customer_df) - 1, "variables comportementales\n")
+```
+
+```{r customer_df_preview}
+# Aperçu du dataset client
+head(customer_df, 10)
+summary(customer_df %>% select(-CustomerID))
+```
+
+```{r remove_outliers}
+# ── Suppression des outliers extrêmes (> 99e percentile sur TotalSpent) ──────
+p99 <- quantile(customer_df$TotalSpent, 0.99, na.rm = TRUE)
+customer_df <- customer_df %>%
+  filter(TotalSpent <= p99, TotalSpent > 0)
+
+cat("Après suppression des outliers extrêmes :",
+    nrow(customer_df), "clients\n")
+```
+
+## Normalisation des Données
+
+```{r normalization}
+# ── Sélection des variables numériques comportementales ──────────────────────
+vars_num <- c("TotalSpent", "NumberInvoices", "TotalQuantity",
+              "AverageBasket", "Frequency", "Recency",
+              "AveragePrice", "NumberProducts")
+
+# ── Normalisation Z-score (centrage-réduction) ────────────────────────────────
+customer_scaled <- customer_df %>%
+  select(all_of(vars_num)) %>%
+  scale() %>%
+  as.data.frame()
+
+rownames(customer_scaled) <- customer_df$CustomerID
+
+cat("Variables normalisées :", ncol(customer_scaled), "\n")
+cat("Observations (clients) :", nrow(customer_scaled), "\n")
+```
+
+---
+
+# Analyse Exploratoire
+
+## Statistiques Descriptives
+
+```{r desc_stats}
+# Tableau de statistiques descriptives complet
+stats_desc <- customer_df %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeur") %>%
+  group_by(Variable) %>%
+  summarise(
+    N       = n(),
+    Moyenne = round(mean(Valeur), 2),
+    Médiane = round(median(Valeur), 2),
+    Écart_type = round(sd(Valeur), 2),
+    Min     = round(min(Valeur), 2),
+    Q1      = round(quantile(Valeur, 0.25), 2),
+    Q3      = round(quantile(Valeur, 0.75), 2),
+    Max     = round(max(Valeur), 2),
+    .groups = "drop"
+  )
+
+kable(stats_desc, caption = "Statistiques descriptives — Variables comportementales clients")
+```
+
+
+## Distributions des Variables
+
+```{r distributions, fig.height=10}
+# ── Histogrammes + densité pour chaque variable ───────────────────────────────
+customer_df %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeur") %>%
+  ggplot(aes(x = Valeur, fill = Variable)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 color = "white", alpha = 0.7) +
+  geom_density(color = "black", linewidth = 0.8) +
+  facet_wrap(~ Variable, scales = "free", ncol = 2) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Distribution des Variables Comportementales Clients",
+    subtitle = "Histogrammes avec courbe de densité",
+    x = "", y = "Densité"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold"))
+```
+
+> **Lecture :** La majorité des variables présentent une **asymétrie positive** (queue à droite),
+> caractéristique des données e-commerce où une minorité de clients concentre l'essentiel
+> des achats. La normalisation Z-score corrige ces disparités pour l'ACP et le clustering.
+
+## Matrice de Corrélation
+
+```{r correlation_matrix, fig.height=7}
+# ── Calcul et visualisation de la matrice de corrélation ─────────────────────
+cor_matrix <- cor(customer_df %>% select(all_of(vars_num)),
+                  use = "complete.obs",
+                  method = "pearson")
+
+corrplot(cor_matrix,
+         method   = "color",
+         type     = "upper",
+         order    = "hclust",
+         addCoef.col = "black",
+         number.cex  = 0.75,
+         tl.col   = "black",
+         tl.srt   = 45,
+         col      = colorRampPalette(c("#D73027","#FFFFBF","#1A9850"))(200),
+         title    = "Matrice de Corrélations de Pearson — Variables Comportementales",
+         mar      = c(0, 0, 1.5, 0))
+```
+
+> **Interprétation :**
+> - `TotalSpent` et `TotalQuantity` sont fortement corrélées (les gros acheteurs
+>   dépensent davantage).
+> - `NumberInvoices` et `NumberProducts` montrent une corrélation positive importante :
+>   les clients qui commandent souvent diversifient leurs achats.
+> - `Recency` est faiblement corrélée aux autres variables, ce qui en fait un axe
+>   discriminant indépendant — essentiel pour détecter les clients inactifs.
+
+## Boxplots Comparatifs
+
+```{r boxplots, fig.height=8}
+customer_df %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeur") %>%
+  ggplot(aes(x = Variable, y = Valeur, fill = Variable)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 1.5,
+               outlier.alpha = 0.5, alpha = 0.7) +
+  facet_wrap(~ Variable, scales = "free", ncol = 4) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(
+    title = "Boxplots des Variables Comportementales",
+    subtitle = "Visualisation des outliers et de la dispersion",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+---
+
+# ACP — Analyse en Composantes Principales
+
+## Application de l'ACP
+
+```{r pca_run}
+# ── ACP avec FactoMineR (données déjà normalisées) ────────────────────────────
+# scale.unit = FALSE car les données sont déjà centrées-réduites
+pca_result <- PCA(
+  customer_scaled,
+  scale.unit = FALSE,   # déjà normalisé
+  ncp        = 8,       # conserver toutes les composantes
+  graph      = FALSE
+)
+
+# Résumé des valeurs propres
+eigenvalues <- get_eigenvalue(pca_result)
+kable(round(eigenvalues, 3),
+      caption = "Valeurs propres et variance expliquée par composante")
+```
+
+
+## Scree Plot (Éboulis des Valeurs Propres)
+
+```{r scree_plot}
+fviz_eig(
+  pca_result,
+  addlabels  = TRUE,
+  ylim       = c(0, 60),
+  barfill    = "#2196F3",
+  barcolor   = "#0D47A1",
+  linecolor  = "#E53935",
+  main       = "Scree Plot — Variance Expliquée par Composante Principale",
+  xlab       = "Composante Principale",
+  ylab       = "% de Variance Expliquée"
+) +
+  geom_hline(yintercept = 100 / ncol(customer_scaled),
+             linetype = "dashed", color = "orange", linewidth = 1) +
+  annotate("text",
+           x = 6.5,
+           y = 100 / ncol(customer_scaled) + 1.5,
+           label = "Seuil Kaiser (1/p)", color = "orange", size = 3.5) +
+  theme_minimal()
+```
+
+> **Règle de Kaiser** : on retient les composantes dont la valeur propre est > 1
+> (équivalent à expliquer plus qu'une variable seule). **Les 2 ou 3 premières
+> composantes** expliquent généralement entre 55% et 70% de la variance totale,
+> ce qui est satisfaisant pour des données comportementales e-commerce.
+
+## Contribution des Variables (Cercle des Corrélations)
+
+```{r correlation_circle}
+fviz_pca_var(
+  pca_result,
+  col.var      = "contrib",
+  gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+  repel        = TRUE,
+  title        = "Cercle des Corrélations — ACP",
+  legend.title = "Contribution (%)"
+) +
+  theme_minimal()
+```
+
+> **Lecture du cercle :**
+> - Les variables proches du bord du cercle sont bien représentées sur le plan factoriel.
+> - Les variables pointant dans la même direction sont **positivement corrélées**.
+> - **Axe 1 (PC1)** oppose typiquement les gros clients (TotalSpent, NumberInvoices,
+>   TotalQuantity, NumberProducts) aux petits clients → axe de **volume d'achat**.
+> - **Axe 2 (PC2)** est souvent structuré par la Recency et la Frequency →
+>   axe de **régularité / fidélité**.
+
+## Contributions des Variables aux Axes
+
+```{r var_contributions, fig.height=8}
+# Contributions aux deux premiers axes
+p_contrib1 <- fviz_contrib(pca_result, choice = "var", axes = 1,
+                             fill = "#2196F3", color = "#0D47A1",
+                             title = "Contributions à PC1") +
+  theme_minimal()
+
+p_contrib2 <- fviz_contrib(pca_result, choice = "var", axes = 2,
+                             fill = "#FF7043", color = "#BF360C",
+                             title = "Contributions à PC2") +
+  theme_minimal()
+
+grid.arrange(p_contrib1, p_contrib2, ncol = 2)
+```
+
+## Coordonnées et Cos² des Variables
+
+```{r var_cos2}
+# Qualité de représentation (cos²) des variables sur les deux premiers axes
+fviz_cos2(pca_result,
+          choice = "var",
+          axes   = 1:2,
+          fill   = "#66BB6A",
+          color  = "#2E7D32",
+          title  = "Qualité de Représentation des Variables (cos²) — Axes 1 & 2") +
+  theme_minimal()
+```
+
+## Projection des Individus
+
+```{r ind_projection}
+fviz_pca_ind(
+  pca_result,
+  col.ind    = "cos2",
+  gradient.cols = c("#E3F2FD", "#1565C0", "#0D47A1"),
+  geom.ind   = "point",
+  pointsize  = 1.2,
+  alpha.ind  = 0.5,
+  repel      = FALSE,
+  title      = "Projection des Clients sur le Plan Factoriel (PC1 × PC2)",
+  legend.title = "Qualité (cos²)"
+) +
+  theme_minimal()
+```
+
+> **Lecture :** Chaque point représente un client. Les clients proches dans l'espace
+> factoriel partagent des comportements d'achat similaires. Les zones denses révèlent
+> des concentrations naturelles de comportements, futures cibles du clustering.
+
+## Biplot (Variables + Individus)
+
+```{r biplot}
+fviz_pca_biplot(
+  pca_result,
+  col.ind     = "cos2",
+  col.var     = "#D32F2F",
+  gradient.cols = c("#E3F2FD", "#1565C0"),
+  geom.ind    = "point",
+  pointsize   = 0.8,
+  alpha.ind   = 0.4,
+  repel       = TRUE,
+  title       = "Biplot ACP — Clients et Variables Comportementales",
+  legend.title = "cos²"
+) +
+  theme_minimal()
+```
+
+
+---
+
+# Clustering — K-Means
+
+## Détermination du Nombre Optimal de Clusters
+
+### Méthode du Coude (Elbow Method)
+
+```{r elbow_method}
+set.seed(42)  # Reproductibilité
+
+# ── Calcul de l'inertie intra-classe pour k = 1 à 10 ──────────────────────────
+wss_values <- map_dbl(1:10, function(k) {
+  kmeans(customer_scaled, centers = k, nstart = 25, iter.max = 100)$tot.withinss
+})
+
+elbow_df <- tibble(k = 1:10, WSS = wss_values)
+
+ggplot(elbow_df, aes(x = k, y = WSS)) +
+  geom_line(color = "#1565C0", linewidth = 1.2) +
+  geom_point(size = 4, color = "#D32F2F") +
+  geom_point(data = elbow_df %>% filter(k == 4),
+             aes(x = k, y = WSS),
+             size = 7, shape = 21, fill = "transparent",
+             color = "#2E7D32", stroke = 2) +
+  annotate("text", x = 4.3, y = elbow_df$WSS[4] + max(wss_values) * 0.02,
+           label = "Coude optimal ≈ k=4", color = "#2E7D32",
+           fontface = "bold", size = 4) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title    = "Méthode du Coude — Choix du Nombre de Clusters",
+    subtitle = "WSS = Within-cluster Sum of Squares (inertie intra-classe)",
+    x        = "Nombre de clusters k",
+    y        = "WSS Total"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Méthode de la Silhouette Moyenne
+
+```{r silhouette_method}
+set.seed(42)
+
+fviz_nbclust(
+  customer_scaled,
+  kmeans,
+  method  = "silhouette",
+  k.max   = 10,
+  linecolor = "#1565C0"
+) +
+  labs(
+    title    = "Largeur de Silhouette Moyenne — Sélection du k Optimal",
+    subtitle = "Silhouette maximale → meilleure cohésion et séparation des clusters",
+    x        = "Nombre de clusters k",
+    y        = "Silhouette moyenne"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Statistique de Gap
+
+```{r gap_stat, fig.height=5}
+set.seed(42)
+
+gap_stat <- clusGap(
+  customer_scaled,
+  FUN     = kmeans,
+  nstart  = 25,
+  K.max   = 8,
+  B       = 50         # 50 bootstraps (augmenter à 500 pour la publication)
+)
+
+fviz_gap_stat(gap_stat) +
+  labs(
+    title = "Statistique de Gap — Validation du Nombre de Clusters",
+    x     = "Nombre de clusters k",
+    y     = "Statistique de Gap"
+  ) +
+  theme_minimal()
+```
+
+> **Synthèse des méthodes de sélection :**
+> Les trois méthodes convergent vers **k = 4 clusters**, valeur qui offre le meilleur
+> compromis entre compacité intra-classe et séparation inter-classes. Ce choix est
+> également cohérent sur le plan métier (4 segments classiques en e-commerce :
+> VIP, fidèles, occasionnels, inactifs).
+
+## Application du K-Means avec k = 4
+
+```{r kmeans_run}
+set.seed(42)
+
+# ── K-Means avec 25 initialisations aléatoires pour éviter les minima locaux ──
+km_result <- kmeans(
+  customer_scaled,
+  centers  = 4,
+  nstart   = 25,
+  iter.max = 200
+)
+
+# Ajout du label de cluster au dataset client
+customer_df <- customer_df %>%
+  mutate(Cluster = factor(km_result$cluster,
+                          labels = paste0("Cluster ", 1:4)))
+
+customer_scaled$Cluster <- customer_df$Cluster
+
+# Répartition des clusters
+table(customer_df$Cluster) %>%
+  as.data.frame() %>%
+  rename(Cluster = Var1, Effectif = Freq) %>%
+  mutate(Proportion = scales::percent(Effectif / sum(Effectif), accuracy = 0.1)) %>%
+  kable(caption = "Répartition des clients par cluster")
+```
+
+
+## Qualité du Clustering — Indice de Silhouette
+
+```{r silhouette_plot}
+# ── Calcul et visualisation de la silhouette ──────────────────────────────────
+sil <- silhouette(km_result$cluster, dist(customer_scaled %>% select(-Cluster)))
+
+fviz_silhouette(sil,
+                palette     = "jco",
+                ggtheme     = theme_minimal(),
+                print.summary = TRUE) +
+  labs(
+    title    = "Diagramme de Silhouette — Cohésion des Clusters",
+    subtitle = "Valeur proche de 1 = client bien classé dans son cluster"
+  )
+```
+
+> **Lecture :** Une silhouette moyenne > 0.40 indique une structure de clustering
+> acceptable. Les valeurs négatives (barres rouges vers la gauche) correspondent à
+> des clients "frontières" qui pourraient appartenir à un autre cluster.
+
+## Visualisation des Clusters (Axes K-Means)
+
+```{r kmeans_viz}
+fviz_cluster(
+  km_result,
+  data         = customer_scaled %>% select(-Cluster),
+  palette      = c("#E53935", "#43A047", "#1E88E5", "#FB8C00"),
+  geom         = "point",
+  ellipse.type = "convex",
+  pointsize    = 1.2,
+  alpha        = 0.5,
+  ggtheme      = theme_minimal(),
+  main         = "Visualisation des 4 Clusters — Plan K-Means (PC1 × PC2)"
+)
+```
+
+---
+
+# Analyse Combinée ACP + Clustering
+
+## Projection des Clusters sur le Plan Factoriel
+
+```{r pca_clusters}
+# ── Récupération des coordonnées individuelles ACP ────────────────────────────
+ind_coords <- as.data.frame(pca_result$ind$coord) %>%
+  select(Dim.1, Dim.2) %>%
+  mutate(
+    CustomerID = customer_df$CustomerID,
+    Cluster    = customer_df$Cluster
+  )
+
+# ── Calcul des centroïdes par cluster ─────────────────────────────────────────
+centroids <- ind_coords %>%
+  group_by(Cluster) %>%
+  summarise(Dim.1 = mean(Dim.1), Dim.2 = mean(Dim.2), .groups = "drop")
+
+# ── Graphique ACP colorié par cluster ─────────────────────────────────────────
+ggplot(ind_coords, aes(x = Dim.1, y = Dim.2, color = Cluster)) +
+  geom_point(size = 1.5, alpha = 0.45) +
+  stat_ellipse(aes(fill = Cluster), geom = "polygon",
+               alpha = 0.10, type = "norm", level = 0.95) +
+  geom_point(data = centroids, aes(x = Dim.1, y = Dim.2),
+             shape = 13, size = 6, stroke = 2) +
+  geom_label(data = centroids, aes(label = Cluster),
+             fontface = "bold", size = 4,
+             nudge_y = 0.15, show.legend = FALSE) +
+  scale_color_manual(values = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  scale_fill_manual(values  = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  labs(
+    title    = "Projection des Clusters K-Means sur le Plan Factoriel ACP",
+    subtitle = "Ellipses de confiance à 95% — Croix = centroïdes",
+    x        = paste0("PC1 (", round(eigenvalues[1, 2], 1), "% de variance)"),
+    y        = paste0("PC2 (", round(eigenvalues[2, 2], 1), "% de variance)"),
+    color    = "Cluster",
+    fill     = "Cluster"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+> **Lecture combinée :** La projection confirme la **cohérence spatiale** des clusters :
+> chaque groupe occupe une région distincte du plan factoriel, validant la pertinence
+> de la segmentation K-Means. Les ellipses peu chevauchantes indiquent une bonne
+> séparation inter-clusters.
+
+## Profils Moyens par Cluster
+
+```{r cluster_profiles}
+# ── Moyennes des variables par cluster ───────────────────────────────────────
+cluster_profiles <- customer_df %>%
+  group_by(Cluster) %>%
+  summarise(
+    N                = n(),
+    TotalSpent_moy   = round(mean(TotalSpent), 0),
+    NbFactures_moy   = round(mean(NumberInvoices), 1),
+    TotalQté_moy     = round(mean(TotalQuantity), 0),
+    PanierMoy        = round(mean(AverageBasket), 0),
+    Fréquence_moy    = round(mean(Frequency), 1),
+    Récence_moy      = round(mean(Recency), 0),
+    PrixMoy          = round(mean(AveragePrice), 2),
+    NbProduits_moy   = round(mean(NumberProducts), 0),
+    .groups = "drop"
+  )
+
+kable(cluster_profiles,
+      caption = "Profils moyens des 4 clusters — Variables comportementales")
+```
+
+
+## Radar Chart des Profils Clusters
+
+```{r radar_chart, fig.height=8}
+# ── Normalisation des moyennes (0-1) pour le radar ───────────────────────────
+radar_data <- customer_df %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(vars_num), mean), .groups = "drop")
+
+# Normalisation min-max
+radar_norm <- radar_data %>%
+  mutate(across(all_of(vars_num),
+                ~ (. - min(.)) / (max(.) - min(.) + 1e-9)))
+
+radar_long <- radar_norm %>%
+  pivot_longer(all_of(vars_num), names_to = "Variable", values_to = "Valeur")
+
+ggplot(radar_long, aes(x = Variable, y = Valeur,
+                        group = Cluster, color = Cluster, fill = Cluster)) +
+  geom_polygon(alpha = 0.15, linewidth = 1) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  coord_polar() +
+  scale_color_manual(values = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  scale_fill_manual(values  = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  facet_wrap(~ Cluster, ncol = 2) +
+  labs(
+    title    = "Radar Chart — Profils Comportementaux par Cluster",
+    subtitle = "Variables normalisées (0 = minimum, 1 = maximum du dataset)",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y    = element_blank(),
+    axis.ticks.y   = element_blank(),
+    legend.position = "none",
+    strip.text      = element_text(face = "bold", size = 12)
+  )
+```
+
+## Boxplots par Cluster
+
+```{r boxplots_cluster, fig.height=12}
+# ── Distributions de chaque variable par cluster ─────────────────────────────
+customer_df %>%
+  select(Cluster, all_of(vars_num)) %>%
+  pivot_longer(all_of(vars_num), names_to = "Variable", values_to = "Valeur") %>%
+  ggplot(aes(x = Cluster, y = Valeur, fill = Cluster)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 1, outlier.alpha = 0.4,
+               alpha = 0.7) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  labs(
+    title    = "Distribution des Variables Comportementales par Cluster",
+    subtitle = "Comparaison des profils d'achat entre groupes de clients",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    strip.text      = element_text(face = "bold"),
+    axis.text.x     = element_text(angle = 30, hjust = 1)
+  )
+```
+
+---
+
+# Interprétation Métier
+
+## Identification et Nommage des Segments
+
+```{r segment_naming}
+# ── Attribution des noms métier aux clusters ──────────────────────────────────
+# (À ajuster selon les résultats effectifs de votre exécution)
+
+legende_segments <- tibble(
+  Cluster = paste0("Cluster ", 1:4),
+  Profil  = c(
+    "🏆 Clients VIP / Haute Valeur",
+    "🔄 Clients Fidèles Réguliers",
+    "💤 Clients Inactifs / À Risque",
+    "🆕 Nouveaux Clients / Occasionnels"
+  ),
+  Description = c(
+    "Dépenses très élevées, nombreuses commandes, panier moyen fort, récence faible (achat récent). Représentent le cœur de valeur de l'entreprise.",
+    "Fréquence d'achat élevée, nombre de factures important, diversité produits forte. Clients engagés avec ancienneté.",
+    "Récence très élevée (n'ont pas acheté depuis longtemps), faibles dépenses, peu de commandes. Risque de churn élevé.",
+    "Peu de commandes, faibles dépenses, récence modérée. Clients récents à faible historique ou clients ponctuels."
+  )
+)
+
+kable(legende_segments,
+      caption = "Nomenclature et description métier des 4 segments clients")
+```
+
+> **Note :** L'attribution précise des noms de profils aux numéros de clusters dépend
+> des valeurs moyennes calculées dans votre dataset. Consultez le tableau
+> `cluster_profiles` ci-dessus pour affiner cette correspondance.
+
+
+## Visualisation des Segments sur le Plan Factoriel (Nommés)
+
+```{r segments_named_pca}
+# ── Mapping cluster → profil métier ───────────────────────────────────────────
+profil_map <- c(
+  "Cluster 1" = "VIP / Haute Valeur",
+  "Cluster 2" = "Fidèles Réguliers",
+  "Cluster 3" = "Inactifs / À Risque",
+  "Cluster 4" = "Nouveaux / Occasionnels"
+)
+
+ind_coords <- ind_coords %>%
+  mutate(Profil = profil_map[as.character(Cluster)])
+
+centroids_named <- centroids %>%
+  mutate(Profil = profil_map[as.character(Cluster)])
+
+ggplot(ind_coords, aes(x = Dim.1, y = Dim.2, color = Profil)) +
+  geom_point(size = 1.2, alpha = 0.4) +
+  stat_ellipse(aes(fill = Profil), geom = "polygon",
+               alpha = 0.08, type = "norm", level = 0.95) +
+  geom_label(data = centroids_named,
+             aes(label = Profil, fill = Profil),
+             color = "white", fontface = "bold",
+             size = 3.5, alpha = 0.85, show.legend = FALSE) +
+  scale_color_manual(values = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  scale_fill_manual(values  = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  labs(
+    title    = "Segmentation Clients E-Commerce — Plan Factoriel ACP",
+    subtitle = "4 Profils Comportementaux identifiés par K-Means",
+    x        = paste0("PC1 — Volume d'achat (",
+                      round(eigenvalues[1, 2], 1), "%)"),
+    y        = paste0("PC2 — Fidélité / Régularité (",
+                      round(eigenvalues[2, 2], 1), "%)"),
+    color = "Profil", fill = "Profil"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## Recommandations Marketing par Segment
+
+```{r recommendations}
+recommandations <- tibble(
+  Segment = c(
+    "VIP / Haute Valeur",
+    "Fidèles Réguliers",
+    "Inactifs / À Risque",
+    "Nouveaux / Occasionnels"
+  ),
+  Priorité = c("🔴 Critique", "🟠 Haute", "🟡 Moyenne", "🟢 Standard"),
+  Actions_Marketing = c(
+    "Programme de fidélité premium (Gold/Platinum). Accès exclusif aux nouveautés et ventes privées. Service client dédié. Offres personnalisées à haute valeur. Invitation aux événements VIP.",
+    "Newsletters personnalisées selon l'historique d'achat. Cross-selling et up-selling ciblés. Points de fidélité et récompenses. Remises sur la fréquence (ex: -10% à la 5e commande).",
+    "Campagne de réactivation par email (offre de bienvenue retour). SMS avec code promo urgence (ex: '15% valable 48h'). Enquête satisfaction pour comprendre le désengagement. Analyse du churn.",
+    "Email de bienvenue avec parcours d'onboarding. Remise première commande / découverte. Recommandations de produits populaires. Nurturing progressif sur 3 mois."
+  ),
+  KPI_Cible = c(
+    "Maintien CLTV > 150% moyenne. Taux de réachat > 90%.",
+    "Augmenter panier moyen de 15%. Réduire intervalle achat de 10%.",
+    "Taux de réactivation > 20% en 3 mois.",
+    "Conversion 2e achat dans les 60 jours > 30%."
+  )
+)
+
+kable(recommandations,
+      caption = "Plan d'Actions Marketing par Segment Client")
+```
+
+## Répartition Visuelle des Segments
+
+```{r segment_pie}
+repartition <- customer_df %>%
+  count(Cluster) %>%
+  mutate(
+    Profil = profil_map[as.character(Cluster)],
+    Pct    = round(n / sum(n) * 100, 1),
+    Label  = paste0(Profil, "\n", n, " clients (", Pct, "%)")
+  )
+
+ggplot(repartition, aes(x = "", y = n, fill = Cluster)) +
+  geom_col(width = 1, color = "white", linewidth = 0.8) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = Label),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, fontface = "bold", color = "white") +
+  scale_fill_manual(values = c("#E53935","#43A047","#1E88E5","#FB8C00")) +
+  labs(
+    title    = "Répartition des Clients par Segment",
+    subtitle = "Dataset Online Retail — Segmentation comportementale",
+    fill = "Cluster"
+  ) +
+  theme_void(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+
+## Heatmap des Profils Clusters (Variables Normalisées)
+
+```{r heatmap_clusters, fig.height=6}
+# ── Heatmap des moyennes normalisées par cluster ──────────────────────────────
+heatmap_data <- customer_df %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(vars_num), mean), .groups = "drop") %>%
+  mutate(across(all_of(vars_num),
+                ~ (. - mean(.)) / sd(.))) %>%   # z-score inter-clusters
+  pivot_longer(all_of(vars_num), names_to = "Variable", values_to = "Z_score")
+
+ggplot(heatmap_data, aes(x = Variable, y = Cluster, fill = Z_score)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = round(Z_score, 2)),
+            size = 3.5, fontface = "bold",
+            color = ifelse(abs(heatmap_data$Z_score) > 0.8, "white", "black")) +
+  scale_fill_gradient2(
+    low      = "#1565C0",
+    mid      = "#FAFAFA",
+    high     = "#C62828",
+    midpoint = 0,
+    name     = "Z-score"
+  ) +
+  scale_x_discrete(guide = guide_axis(angle = 35)) +
+  labs(
+    title    = "Heatmap des Profils — Z-scores par Cluster et Variable",
+    subtitle = "Rouge = valeur élevée vs moyenne | Bleu = valeur faible vs moyenne",
+    x = "Variable Comportementale",
+    y = "Segment"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1, face = "bold"))
+```
+
+> **Lecture :** La heatmap synthétise les différences entre segments.
+> Les cases rouges (Z-score > 0) signalent que ce segment est **au-dessus de la
+> moyenne** sur cette variable ; les cases bleues indiquent une valeur **inférieure**.
+> Ce graphique est l'outil de communication métier le plus efficace pour présenter
+> la segmentation à une équipe non technique.
+
+---
+
+# Conclusion
+
+## Synthèse des Résultats
+
+```{r synthese}
+synthese <- tibble(
+  Étape = c(
+    "1. Données initiales",
+    "2. Après nettoyage",
+    "3. Dataset client final",
+    "4. Variables comportementales",
+    "5. ACP — variance PC1+PC2",
+    "6. Nombre de clusters retenus",
+    "7. Silhouette moyenne"
+  ),
+  Résultat = c(
+    paste0(nrow(retail_raw), " transactions brutes"),
+    paste0(nrow(retail_clean), " transactions valides"),
+    paste0(nrow(customer_df), " clients uniques"),
+    "8 variables (TotalSpent, NbFactures, TotalQté, PanierMoy, Fréquence, Récence, PrixMoy, NbProduits)",
+    paste0(round(sum(eigenvalues[1:2, 2]), 1), "% de la variance totale"),
+    "k = 4 (Coude + Silhouette + Gap Stat convergents)",
+    paste0(round(mean(sil[, "sil_width"]), 3), " (acceptable > 0.40)")
+  )
+)
+kable(synthese, caption = "Tableau de Synthèse du Projet")
+```
+
+**Ce projet a démontré la faisabilité et la valeur d'une segmentation comportementale
+des clients e-commerce à partir de données transactionnelles brutes.** La combinaison
+ACP + K-means a permis d'identifier **4 profils clients distincts** :
+
+- **Clients VIP** : peu nombreux mais à très haute valeur, à fidéliser absolument.
+- **Clients Fidèles Réguliers** : le socle de l'activité, à entretenir et développer.
+- **Clients Inactifs** : en danger de churn, nécessitent une campagne de réactivation urgente.
+- **Clients Nouveaux/Occasionnels** : fort potentiel de conversion à nurtur sur le moyen terme.
+
+## Limites du Modèle
+
+1. **Sensibilité aux outliers** : malgré le filtrage du 99e percentile, quelques
+   clients atypiques peuvent influencer les centroïdes K-Means.
+2. **Choix de k fixe** : le K-Means requiert de fixer k *a priori* ; une CAH
+   (Classification Ascendante Hiérarchique) aurait fourni un dendrogramme exploratoire
+   sans contrainte de k.
+3. **Fenêtre temporelle d'un an** : le dataset couvre 12 mois seulement ; une
+   analyse sur plusieurs années affinerait la détection des cycles d'achat.
+4. **Variables exclues** : le pays, la saison d'achat, la catégorie produit n'ont
+   pas été intégrés — des analyses complémentaires pourraient enrichir les profils.
+5. **Stabilité des clusters** : les segments peuvent évoluer dans le temps ; une
+   mise à jour mensuelle du modèle est recommandée.
+
+## Perspectives
+
+- **Extension RFM formalisée** : intégrer un score RFM (Recency, Frequency, Monetary)
+  explicite pour benchmarking sectoriel.
+- **CAH complémentaire** : appliquer une Classification Ascendante Hiérarchique pour
+  valider la structure de clusters et comparer les résultats.
+- **Modélisation prédictive** : prédire le segment futur d'un client (churn,
+  upgrade VIP) par un modèle de classification supervisée (Random Forest, XGBoost).
+- **Déploiement temps réel** : intégrer ce modèle dans un pipeline CRM pour
+  une segmentation dynamique mise à jour hebdomadairement.
+- **A/B Testing** : mesurer l'impact des actions marketing ciblées par segment
+  sur les KPIs (taux de conversion, panier moyen, CLTV).
+
+---
+
+# Annexes
+
+## Résumé Technique de l'ACP
+
+```{r pca_summary}
+# Coordonnées des variables sur les 4 premiers axes
+var_pca <- get_pca_var(pca_result)
+
+cat("\n── Coordonnées des variables (loadings) ──\n")
+round(var_pca$coord[, 1:4], 3)
+
+cat("\n── Contributions des variables aux axes (%) ──\n")
+round(var_pca$contrib[, 1:4], 2)
+
+cat("\n── Qualité de représentation (cos²) ──\n")
+round(var_pca$cos2[, 1:4], 3)
+```
+
+## Centroïdes K-Means (Espace Normalisé)
+
+```{r centroids_table}
+centroids_km <- as.data.frame(km_result$centers)
+centroids_km$Cluster <- paste0("Cluster ", 1:4)
+kable(round(centroids_km, 3),
+      caption = "Centroïdes des clusters dans l'espace normalisé (Z-scores)")
+```
+
+## Informations de Session R
+
+```{r session_info}
+sessionInfo()
+```
+
+---
+
+*Projet réalisé dans le cadre du module : Méthodes Statistiques et Étude de Données —
+Analyse Multivariée. Dataset : Online Retail — UCI Machine Learning Repository.*

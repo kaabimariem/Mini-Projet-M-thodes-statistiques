@@ -7,7 +7,7 @@
 # ── 0. PACKAGES ───────────────────────────────────────────────────────────────
 pkgs <- c("tidyverse","lubridate","FactoMineR","factoextra",
           "cluster","corrplot","scales","gridExtra",
-          "readxl","readr","purrr","stringr")
+          "readxl","readr","purrr","stringr","mclust")
 invisible(lapply(pkgs, function(p) {
   if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
   library(p, character.only = TRUE)
@@ -28,16 +28,16 @@ PALETTE <- c("#E53935","#43A047","#1E88E5","#FB8C00",
 if (file.exists("Online Retail.xlsx")) {
   retail_raw <- read_excel("Online Retail.xlsx")
   message("✅ Fichier Excel local chargé : ", nrow(retail_raw), " lignes")
-
+  
 } else if (file.exists("Online Retail.csv")) {
   retail_raw <- read_csv("Online Retail.csv", show_col_types = FALSE)
   message("✅ Fichier CSV local chargé : ", nrow(retail_raw), " lignes")
-
+  
 } else {
   # read_excel() ne supporte pas les URLs → téléchargement préalable requis
   url_data  <- "https://archive.ics.uci.edu/ml/machine-learning-databases/00352/Online%20Retail.xlsx"
   dest_file <- tempfile(fileext = ".xlsx")
-
+  
   message("⏳ Téléchargement du fichier depuis UCI…")
   retail_raw <- tryCatch({
     download.file(url_data, destfile = dest_file, mode = "wb", quiet = TRUE)
@@ -59,9 +59,8 @@ cat("Dimensions brutes :", nrow(retail_raw), "×", ncol(retail_raw), "\n")
 retail <- retail_raw %>%
   rename_with(str_trim) %>%
   mutate(
-    InvoiceDate = parse_date_time(InvoiceDate,
-                                  orders = c("dmy HM","mdy HM","ymd HM",
-                                             "dmy HMS","mdy HMS")),
+    InvoiceDate = as.POSIXct(InvoiceDate, format = "%d/%m/%Y %H:%M", tz = "UTC"),
+    
     CustomerID  = as.character(CustomerID),
     Quantity    = as.numeric(Quantity),
     UnitPrice   = as.numeric(UnitPrice)
@@ -90,7 +89,7 @@ customer_df <- retail %>%
     AverageBasket  = TotalSpent / NumberInvoices,
     Frequency      = as.numeric(difftime(max(InvoiceDate), min(InvoiceDate),
                                          units = "days")) /
-                     pmax(NumberInvoices - 1, 1),
+      pmax(NumberInvoices - 1, 1),
     Recency        = as.numeric(difftime(date_ref, max(InvoiceDate),
                                          units = "days")),
     AveragePrice   = mean(UnitPrice, na.rm = TRUE),
@@ -116,8 +115,34 @@ cat("Dataset client final :", nrow(customer_df), "clients ×",
 if (nrow(customer_df) == 0)
   stop("❌ customer_df est vide. Relancez TOUT le script depuis le début avec Ctrl+Shift+S")
 
-# ── 5. STATISTIQUES DESCRIPTIVES ──────────────────────────────────────────────
+# ── 5. STATISTIQUES DESCRIPTIVES + VISUALISATIONS DES DISTRIBUTIONS ──────────
 print(summary(customer_df %>% select(all_of(vars_num))))
+
+# Histogrammes des distributions de chaque variable (avant normalisation)
+customer_df %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeur") %>%
+  ggplot(aes(x = Valeur)) +
+  geom_histogram(bins = 40, fill = "#1E88E5", color = "white", alpha = 0.85) +
+  facet_wrap(~ Variable, scales = "free", ncol = 4) +
+  labs(title = "Distribution des Variables — Avant Normalisation",
+       x = "", y = "Fréquence") +
+  theme_minimal(base_size = 10) +
+  theme(strip.text = element_text(face = "bold"))
+
+# Boxplots pour détecter les outliers par variable
+customer_df %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeur") %>%
+  ggplot(aes(x = Variable, y = Valeur)) +
+  geom_boxplot(fill = "#42A5F5", color = "#0D47A1",
+               outlier.colour = "#D32F2F", outlier.size = 1, alpha = 0.7) +
+  facet_wrap(~ Variable, scales = "free", ncol = 4) +
+  labs(title = "Boxplots des Variables — Détection des Outliers",
+       x = "", y = "") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_blank(),
+        strip.text  = element_text(face = "bold"))
 
 # ── 6. NORMALISATION ──────────────────────────────────────────────────────────
 # customer_scaled = dataframe purement numérique (JAMAIS de colonne Cluster dedans)
@@ -156,6 +181,26 @@ stopifnot("NA détectés dans customer_scaled après scale()" =
 cat("✅ Normalisation OK —", nrow(customer_scaled), "clients ×",
     ncol(customer_scaled), "variables, 0 NA\n")
 
+# ── 6b. MATRICE DE CORRÉLATIONS ───────────────────────────────────────────────
+# Visualiser les corrélations entre variables avant l'ACP
+# permet de justifier la pertinence de la réduction de dimension
+
+cor_matrix <- cor(customer_df %>% select(all_of(vars_num)), method = "pearson")
+cat("\nMatrice de corrélations (Pearson) :\n")
+print(round(cor_matrix, 2))
+
+corrplot(cor_matrix,
+         method   = "color",
+         type     = "upper",
+         order    = "hclust",
+         addCoef.col = "black",
+         number.cex  = 0.7,
+         tl.col   = "black",
+         tl.srt   = 45,
+         col      = colorRampPalette(c("#1565C0","#FFFFFF","#C62828"))(200),
+         title    = "Matrice de Corrélations — Variables Clients",
+         mar      = c(0, 0, 2, 0))
+
 # ── 7. ACP ────────────────────────────────────────────────────────────────────
 pca_result  <- PCA(customer_scaled, scale.unit = FALSE, ncp = 8, graph = FALSE)
 eigenvalues <- get_eigenvalue(pca_result)
@@ -169,9 +214,29 @@ print(p_scree)
 
 # Cercle des corrélations
 p_circle <- fviz_pca_var(pca_result, col.var = "contrib", repel = TRUE,
-                          gradient.cols = c("#00AFBB","#E7B800","#FC4E07"),
-                          title = "Cercle des Corrélations")
+                         gradient.cols = c("#00AFBB","#E7B800","#FC4E07"),
+                         title = "Cercle des Corrélations")
 print(p_circle)
+
+# Contributions des variables aux axes PC1 et PC2
+p_contrib_pc1 <- fviz_contrib(pca_result, choice = "var", axes = 1, top = 8,
+                              fill = "#1E88E5", color = "#0D47A1") +
+  labs(title = "Contributions des Variables — PC1") +
+  theme_minimal()
+
+p_contrib_pc2 <- fviz_contrib(pca_result, choice = "var", axes = 2, top = 8,
+                              fill = "#43A047", color = "#1B5E20") +
+  labs(title = "Contributions des Variables — PC2") +
+  theme_minimal()
+
+grid.arrange(p_contrib_pc1, p_contrib_pc2, ncol = 2)
+
+# Contributions cumulées PC1+PC2
+p_contrib_12 <- fviz_contrib(pca_result, choice = "var", axes = 1:2, top = 8,
+                             fill = "#FB8C00", color = "#E65100") +
+  labs(title = "Contributions Cumulées — PC1 + PC2") +
+  theme_minimal()
+print(p_contrib_12)
 
 # ── 8. CHOIX DU NOMBRE DE CLUSTERS ───────────────────────────────────────────
 set.seed(42)
@@ -190,7 +255,7 @@ p_elbow <- tibble(k = 1:10, WSS = wss) %>%
 
 # Silhouette — k optimal détecté automatiquement
 p_sil <- fviz_nbclust(customer_scaled, kmeans,
-                       method = "silhouette", k.max = 10) +
+                      method = "silhouette", k.max = 10) +
   labs(title = "Silhouette Moyenne") + theme_minimal()
 
 grid.arrange(p_elbow, p_sil, ncol = 2)
@@ -204,7 +269,7 @@ k_elbow   <- if (is.na(k_elbow)) 4L else k_elbow  # fallback k=4
 
 # Silhouette : k avec silhouette moyenne maximale
 sil_scores <- purrr::map_dbl(2:10, function(k) {
-  km  <- kmeans(customer_scaled, centers = k, nstart = 25)
+  km  <- kmeans(customer_scaled, centers = k, nstart = 25, iter.max = 300)
   sil <- cluster::silhouette(km$cluster, dist(customer_scaled))
   mean(sil[, 3])
 })
@@ -222,7 +287,7 @@ km_result <- kmeans(customer_scaled, centers = k, nstart = 25, iter.max = 200)
 
 # Cluster ajouté UNIQUEMENT dans customer_df — pas dans customer_scaled
 customer_df$Cluster <- factor(km_result$cluster,
-                               labels = paste0("Cluster ", seq_len(k)))
+                              labels = paste0("Cluster ", seq_len(k)))
 
 cat("\nRépartition des clusters :\n")
 print(table(customer_df$Cluster))
@@ -285,6 +350,98 @@ p_heat <- ggplot(heatmap_data, aes(Variable, Cluster, fill = Z)) +
   theme(axis.text.x = element_text(angle = 35, hjust = 1))
 
 print(p_heat)
+
+# ── 14. BOXPLOTS DES VARIABLES PAR CLUSTER ───────────────────────────────────
+# Visualiser la distribution de chaque variable au sein de chaque segment
+customer_df %>%
+  select(all_of(vars_num), Cluster) %>%
+  pivot_longer(all_of(vars_num), names_to = "Variable", values_to = "Valeur") %>%
+  ggplot(aes(x = Cluster, y = Valeur, fill = Cluster)) +
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.5, alpha = 0.75) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = PALETTE[seq_len(k)]) +
+  labs(title = "Distribution des Variables par Cluster",
+       x = "", y = "") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x  = element_text(angle = 30, hjust = 1),
+        strip.text   = element_text(face = "bold"),
+        legend.position = "none")
+
+# ── 15. CLASSIFICATION ASCENDANTE HIÉRARCHIQUE (CAH) ─────────────────────────
+# Comparaison avec K-Means — sur un échantillon pour la lisibilité du dendrogramme
+set.seed(42)
+n_cah    <- min(300, nrow(customer_scaled))   # max 300 clients pour le dendro
+idx_cah  <- sample(seq_len(nrow(customer_scaled)), n_cah)
+dist_cah <- dist(customer_scaled[idx_cah, ], method = "euclidean")
+hc_res   <- hclust(dist_cah, method = "ward.D2")
+
+# Dendrogramme
+p_dendro <- fviz_dend(hc_res,
+                      k            = k,
+                      cex          = 0.4,
+                      k_colors     = PALETTE[seq_len(k)],
+                      color_labels_by_k = TRUE,
+                      rect         = TRUE,
+                      rect_fill    = TRUE,
+                      rect_border  = PALETTE[seq_len(k)],
+                      main         = paste0("Dendrogramme CAH (Ward.D2) — ",
+                                            n_cah, " clients"),
+                      sub          = paste("k =", k, "clusters"),
+                      ylab         = "Hauteur")
+print(p_dendro)
+
+# Clusters CAH sur l'échantillon complet
+# Note : dist() sur grande matrice peut être lent — utilisation de méthode "euclidean"
+# ward.D2 = critère de Ward sur distances au carré (méthode recommandée)
+set.seed(42)
+hc_full      <- hclust(dist(customer_scaled, method = "euclidean"),
+                       method = "ward.D2")
+cah_clusters <- cutree(hc_full, k = k)
+
+# Comparaison CAH vs K-Means (tableau de contingence)
+cat("\n── Comparaison CAH vs K-Means ──\n")
+comparison_table <- table(
+  KMeans = customer_df$Cluster,
+  CAH    = paste0("CAH-", cah_clusters)
+)
+print(comparison_table)
+
+# Indice de Rand ajusté — mclust::adjustedRandIndex (cluster:: ne l'exporte pas)
+rand_adj <- mclust::adjustedRandIndex(km_result$cluster, cah_clusters)
+cat(sprintf("Indice de Rand Ajusté (K-Means vs CAH) : %.3f\n", rand_adj))
+cat("  → (1 = accord parfait | 0 = accord aléatoire)\n")
+
+# ── 16. INTERPRÉTATION MÉTIER DES CLUSTERS ───────────────────────────────────
+# Attribution automatique de labels selon les profils moyens
+profile_scaled <- customer_df %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(vars_num), mean), .groups = "drop")
+
+# Label basé sur TotalSpent (rang) et Recency (rang inversé)
+profile_scaled <- profile_scaled %>%
+  mutate(
+    rank_spent   = rank(-TotalSpent),
+    rank_recency = rank(Recency),       # Recency faible = client récent
+    rank_invoices= rank(-NumberInvoices),
+    label = case_when(
+      rank_spent   == 1 & rank_recency <= 2 ~ "💎 VIP / Fidèle Haut Valeur",
+      rank_invoices== 1 & rank_recency <= 2 ~ "🔄 Acheteur Fréquent",
+      rank_recency == max(rank_recency)     ~ "💤 Client Inactif / À Risque",
+      rank_spent   == max(rank_spent)       ~ "🆕 Nouveau / Occasionnel",
+      TRUE                                  ~ "📦 Client Régulier Moyen"
+    )
+  )
+
+cat("\n── Interprétation Métier des Clusters ──\n")
+print(profile_scaled %>% select(Cluster, TotalSpent, NumberInvoices,
+                                Recency, AverageBasket, label))
+
+cat("\n📌 Recommandations décisionnelles :\n")
+cat("  💎 VIP         → Fidélisation premium, offres exclusives\n")
+cat("  🔄 Fréquent    → Programme de récompenses, cross-selling\n")
+cat("  💤 Inactif     → Campagnes de réactivation (email, promo)\n")
+cat("  🆕 Nouveau     → Onboarding, première commande offerte\n")
+cat("  📦 Régulier    → Upselling, amélioration du panier moyen\n")
 
 message("\n✅ Analyse terminée — ", nrow(customer_df), " clients segmentés en ",
         k, " clusters (k optimal = ", k_optimal, ").")
